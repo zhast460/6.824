@@ -21,8 +21,14 @@ func main() {
 	}
 
 	m := mr.MakeMaster(os.Args[1:], 10)
-	for m.Done() == false {
-		time.Sleep(time.Second)
+	for {
+		reply := &mr.Reply{}
+		m.Done(&mr.Args{}, reply)
+		if reply.Done {
+			break
+		} else {
+			time.Sleep(time.Second)
+		}
 	}
 
 	time.Sleep(time.Second)

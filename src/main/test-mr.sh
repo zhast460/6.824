@@ -101,6 +101,7 @@ wait ; wait
 
 echo '***' Starting map parallelism test.
 
+rm -f mr-*-*
 rm -f mr-out* mr-worker*
 
 timeout -k 2s 180s ../mrmaster ../pg*txt &
@@ -131,6 +132,7 @@ wait ; wait
 
 echo '***' Starting reduce parallelism test.
 
+rm -f mr-*-*
 rm -f mr-out* mr-worker*
 
 timeout -k 2s 180s ../mrmaster ../pg*txt &
@@ -151,6 +153,8 @@ fi
 
 wait ; wait
 
+
+rm -f mr-*-*
 
 # generate the correct output
 ../mrsequential ../../mrapps/nocrash.so ../pg*txt || exit 1

@@ -24,6 +24,18 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type Args struct {
+	HasJob   int    // 0 for no job, 1 for map, 2 for reduce
+	FileName string // for map
+	N        int    // for reduce
+}
+
+type Reply struct {
+	HasJob   int    // 0 for no job, 1 for map, 2 for reduce
+	FileName string // for map
+	N        int    // for reduce
+	Done     bool
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
