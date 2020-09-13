@@ -168,22 +168,39 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	// learned some observations from Raft visualization in its official site (it is so helpful!!!):
+	// 1st: if args term is higher, but log is not as updated as others, others won't vote, they update terms only
+	// 2nd: even though s2 has voted itself in term 11, s1 in term 12 with newer log ask s2 to vote, and s2 gives yes
+	// 3rd: grant yes will reset timeout, grant no won't
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	votedFor := rf.votedFor
+
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	lastLogEntry := rf.getLastLogEntry()
+	if args.Term > rf.currentTerm {
 		rf.ConvertToFollower(args.Term)
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-	} else if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.getLastLogEntry().Term {
+		if args.LastLogTerm > lastLogEntry.Term || args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogEntry.Index {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		} else {
+			reply.VoteGranted = false
+		}
+	}
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogEntry.Term || args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogEntry.Index) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	} else {
 		reply.VoteGranted = false
 	}
+
 	reply.Term = rf.currentTerm
 	DPrintf("%d voted %v for candidate %d. his prev votedFor: %d, his term: %d, requester's term: %d", rf.me, reply.VoteGranted, args.CandidateId, votedFor, rf.currentTerm, args.Term)
 }
@@ -248,6 +265,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else if args.Term > rf.currentTerm {
 		rf.ConvertToFollower(args.Term)
+	} else {
+		rf.lastReceive = time.Now()
 	}
 
 	// TODO
@@ -373,8 +392,8 @@ func (rf *Raft) LeaderElection() {
 			rf.mu.Unlock()
 			return
 		}
-		//DPrintf("%d's lastReceive is %v, startTime is %v", rf.me, rf.lastReceive, startTime)
 		if rf.lastReceive.Before(startTime) && rf.state != Leader {
+			//DPrintf("%d's lastReceive is %v, startTime is %v", rf.me, rf.lastReceive, startTime)
 			go rf.KickoffElection()
 		}
 		rf.mu.Unlock()
@@ -441,6 +460,7 @@ func (rf *Raft) ConvertToFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
 	rf.lastReceive = time.Now()
+	//DPrintf("%d's last receive is updated to %v", rf.me, rf.lastReceive)
 }
 
 func (rf *Raft) ConvertToCandidate() {
