@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 )
-import "labrpc"
+import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
