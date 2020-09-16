@@ -19,10 +19,11 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
-import "../labrpc"
+import "labrpc"
 
 // import "bytes"
 // import "../labgob"
@@ -64,6 +65,8 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
+	cond      *sync.Cond
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -197,6 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(args.LastLogTerm > lastLogEntry.Term || args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogEntry.Index) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.lastReceive = time.Now()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -260,6 +264,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintf("%d received term %d append entries from %d", rf.me, args.Term, args.LeaderId)
 	if args.Term < rf.currentTerm {
+		DPrintf("%d returned false to %d, term too low", rf.me, args.LeaderId)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -269,35 +274,66 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastReceive = time.Now()
 	}
 
-	// TODO
+	if args.PreLogIndex >= len(rf.log) || rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+		DPrintf("%d returned false to %d, pre log mismatch. prelogindex: %d", rf.me, args.LeaderId, args.PreLogIndex)
+		if args.PreLogIndex < len(rf.log) {
+			DPrintf("%d returned false to %d, pre log mismatch. prelogterm: %d, incoming request prelogterm: %d", rf.me, args.LeaderId, rf.log[args.PreLogIndex].Term, args.PreLogTerm)
+		}
+		reply.Success = false
+		return
+	} else {
+		if len(args.Entries) > 0 {
+			rf.log = append(rf.log[0:args.PreLogIndex+1], args.Entries...)
+		}
+		if args.LeaderCommit > rf.commitIndex {
+			from := rf.commitIndex + 1
+			rf.commitIndex = min(args.LeaderCommit, rf.getLastLogEntry().Index)
+			to := rf.commitIndex
+			go rf.applyLogs(from, to)
+		}
+		DPrintf("%d returned true to %d", rf.me, args.LeaderId)
+		reply.Success = true
+	}
+	reply.Term = rf.currentTerm
 }
 
-func (rf *Raft) sendAppendEntries(server int) {
+func (rf *Raft) sendAppendEntries(server int) bool {
 	rf.mu.Lock()
-	lastLogEntry := rf.getLastLogEntry()
+	preLog := rf.log[rf.nextIndex[server]-1]
+	entries := rf.log[rf.nextIndex[server]:]
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PreLogIndex:  lastLogEntry.Index,
-		PreLogTerm:   lastLogEntry.Term,
-		Entries:      nil,
+		PreLogIndex:  preLog.Index,
+		PreLogTerm:   preLog.Term,
+		Entries:      entries,
 		LeaderCommit: rf.commitIndex,
 	}
 	reply := AppendEntriesReply{}
 
-	DPrintf("%d sending term %d append entries to %d", rf.me, rf.currentTerm, server)
+	DPrintf("%d sending term %d append entries to %d, entry size: %d, last command: %d", rf.me, rf.currentTerm, server, len(entries), rf.getLastLogEntry().Command)
 	rf.mu.Unlock()
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
-		return
+		return false
 	}
 
 	rf.mu.Lock()
 	if reply.Term > rf.currentTerm {
 		rf.ConvertToFollower(reply.Term)
+	} else if reply.Success {
+		DPrintf("leader %d got success from %d", rf.me, server)
+		rf.nextIndex[server] = len(rf.log)
+		rf.matchIndex[server] = len(rf.log) - 1
+		rf.advanceCommitIndex()
+	} else {
+		DPrintf("leader %d got NOT success from %d, its nextIndex--", rf.me, server)
+		rf.nextIndex[server]--
 	}
 	rf.mu.Unlock()
+
+	return true
 }
 
 //
@@ -320,7 +356,41 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	DPrintf("starting command %d", command)
+	rf.mu.Lock()
+	index = len(rf.log)
+	term = rf.currentTerm
+	if rf.state != Leader {
+		isLeader = false
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
+	rf.matchIndex[rf.me]++
 
+	rf.log = append(rf.log, LogEntry{
+		Index:   len(rf.log),
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+
+	num := rf.peers
+	rf.mu.Unlock()
+
+	for i := 0; i < len(num); i++ {
+		go func(p int) {
+			if p != rf.me {
+				rf.sendAppendEntries(p)
+			}
+		}(i)
+	}
+
+	//rf.mu.Lock()
+	//for rf.commitIndex < index {
+	//	rf.cond.Wait()
+	//}
+	//rf.mu.Unlock()
+
+	isLeader = true
 	return index, term, isLeader
 }
 
@@ -368,11 +438,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
+	rf.cond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.log = append(rf.log, LogEntry{0, 0, nil})
 	rf.lastReceive = time.Now()
 	go rf.LeaderElection()
 
@@ -448,11 +521,7 @@ func (rf *Raft) KickoffElection() {
 }
 
 func (rf *Raft) getLastLogEntry() LogEntry {
-	if len(rf.log) == 0 {
-		return LogEntry{-1, -1, nil}
-	} else {
-		return rf.log[len(rf.log)-1]
-	}
+	return rf.log[len(rf.log)-1]
 }
 
 func (rf *Raft) ConvertToFollower(newTerm int) {
@@ -472,6 +541,11 @@ func (rf *Raft) ConvertToCandidate() {
 
 func (rf *Raft) ConvertToLeader() {
 	rf.state = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = rf.getLastLogEntry().Index + 1
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
 	rf.lastReceive = time.Now()
 }
 
@@ -487,4 +561,36 @@ func (rf *Raft) sendHeartbeat(p int) {
 		go rf.sendAppendEntries(p)
 		time.Sleep(HeartbeatInterval * time.Millisecond)
 	}
+}
+
+func (rf *Raft) advanceCommitIndex() {
+	// TODO: can do better than sort every time?
+	c := make([]int, len(rf.matchIndex))
+	copy(c, rf.matchIndex)
+	sort.Sort(sort.Reverse(sort.IntSlice(c)))
+	idx := len(rf.peers) / 2
+	from := rf.commitIndex + 1
+	rf.commitIndex = c[idx]
+	//rf.cond.Broadcast()
+	to := rf.commitIndex
+	go rf.applyLogs(from, to)
+}
+
+func (rf *Raft) applyLogs(from, to int) {
+	DPrintf("%d is applying log from index %d to %d", rf.me, from, to)
+	for i := from; i <= to; i++ {
+		log := rf.log[i]
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      log.Command,
+			CommandIndex: log.Index,
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
