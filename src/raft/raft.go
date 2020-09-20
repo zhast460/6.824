@@ -67,6 +67,9 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
 	cond      *sync.Cond
+	appliedUpTo  int
+	applyLogMu   sync.Mutex
+	applyLogCond *sync.Cond
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -206,7 +209,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.currentTerm
-	DPrintf("%d voted %v for candidate %d. his prev votedFor: %d, his term: %d, requester's term: %d", rf.me, reply.VoteGranted, args.CandidateId, votedFor, rf.currentTerm, args.Term)
+	DPrintf("%d voted %v for candidate %d. his prev votedFor: %d, his current term: %d, requester's term: %d", rf.me, reply.VoteGranted, args.CandidateId, votedFor, rf.currentTerm, args.Term)
 }
 
 //
@@ -239,7 +242,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	DPrintf("%d is asking %d to vote for term %d", rf.me, server, rf.currentTerm)
+	// DPrintf("%d is asking %d to vote for term %d", rf.me, server, rf.currentTerm)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -262,9 +265,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("%d received term %d append entries from %d", rf.me, args.Term, args.LeaderId)
+	//DPrintf("%d received term %d append entries from %d", rf.me, args.Term, args.LeaderId)
 	if args.Term < rf.currentTerm {
-		DPrintf("%d returned false to %d, term too low", rf.me, args.LeaderId)
+		DPrintf("%d returned false to %d, term too low. its term: %d, incoming term: %d", rf.me, args.LeaderId, rf.currentTerm, args.Term)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -283,11 +286,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else {
 		if len(args.Entries) > 0 {
+			DPrintf("%d before append log, log len: %d, PreLogIndex: %d, entries len: %d", rf.me, len(rf.log), args.PreLogIndex, len(args.Entries))
 			rf.log = append(rf.log[0:args.PreLogIndex+1], args.Entries...)
+			// TODO: what if an append 2-5 is received, commited and applied, and then an old PRC append 2-4 arrive and delete applied log? need enhancement here.
+			DPrintf("%d after append log, log len: %d, PreLogIndex: %d, entries len: %d", rf.me, len(rf.log), args.PreLogIndex, len(args.Entries))
 		}
 		if args.LeaderCommit > rf.commitIndex {
 			from := rf.commitIndex + 1
-			rf.commitIndex = min(args.LeaderCommit, rf.getLastLogEntry().Index)
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
 			to := rf.commitIndex
 			go rf.applyLogs(from, to)
 		}
@@ -297,10 +303,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 }
 
-func (rf *Raft) sendAppendEntries(server int) bool {
+func (rf *Raft) sendAppendEntries(server int) {
 	rf.mu.Lock()
-	preLog := rf.log[rf.nextIndex[server]-1]
-	entries := rf.log[rf.nextIndex[server]:]
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	nextIndex := rf.nextIndex[server]
+	preLog := rf.log[nextIndex-1]
+	// TODO: design review, do we send a batch of logs, or only one log entry every time?
+	entries := rf.log[nextIndex:]
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -311,29 +323,34 @@ func (rf *Raft) sendAppendEntries(server int) bool {
 	}
 	reply := AppendEntriesReply{}
 
-	DPrintf("%d sending term %d append entries to %d, entry size: %d, last command: %d", rf.me, rf.currentTerm, server, len(entries), rf.getLastLogEntry().Command)
+	DPrintf("%d sending term %d append entries to %d, whose nextIndex: %d, entry size: %d, commands: %v", rf.me, rf.currentTerm, server, rf.nextIndex[server], len(entries), entries)
 	rf.mu.Unlock()
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
-		return false
+		return
 	}
 
 	rf.mu.Lock()
+	// NOTE! at this point, raft instance's state can be different from the state before RPC call
 	if reply.Term > rf.currentTerm {
+		DPrintf("%d see newer term, and convert from leader to follower now. new term: %d", rf.me, reply.Term)
 		rf.ConvertToFollower(reply.Term)
 	} else if reply.Success {
-		DPrintf("leader %d got success from %d", rf.me, server)
-		rf.nextIndex[server] = len(rf.log)
-		rf.matchIndex[server] = len(rf.log) - 1
-		rf.advanceCommitIndex()
+		if len(entries) > 0 {
+			DPrintf("leader %d got success from %d", rf.me, server)
+			rf.matchIndex[server] = preLog.Index + len(entries)
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+			DPrintf("leader %d's current matchIndex: %v", rf.me, rf.matchIndex)
+			rf.advanceCommitIndex()
+		}
 	} else {
-		DPrintf("leader %d got NOT success from %d, its nextIndex--", rf.me, server)
-		rf.nextIndex[server]--
+		if rf.nextIndex[server] == nextIndex {
+			rf.nextIndex[server]--
+		}
+		DPrintf("leader %d got NOT success from %d, its nextIndex-1 = %d", rf.me, server, rf.nextIndex[server])
 	}
 	rf.mu.Unlock()
-
-	return true
 }
 
 //
@@ -356,8 +373,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	DPrintf("starting command %d", command)
 	rf.mu.Lock()
+	DPrintf("starting command %d", command)
 	index = len(rf.log)
 	term = rf.currentTerm
 	if rf.state != Leader {
@@ -440,6 +457,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyLogCond = sync.NewCond(&rf.applyLogMu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
@@ -504,7 +522,7 @@ func (rf *Raft) KickoffElection() {
 				if reply.VoteGranted {
 					numVote++
 					if rf.state == Candidate && numVote > len(rf.peers)/2 {
-						DPrintf("%d become leader for term %d", rf.me, rf.currentTerm)
+						DPrintf("%d BECOME LEADER for term %d", rf.me, rf.currentTerm)
 						rf.ConvertToLeader()
 						for j := 0; j < len(rf.peers); j++ {
 							if j != rf.me {
@@ -546,6 +564,7 @@ func (rf *Raft) ConvertToLeader() {
 		rf.nextIndex[i] = rf.getLastLogEntry().Index + 1
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.lastReceive = time.Now()
 }
 
@@ -573,11 +592,30 @@ func (rf *Raft) advanceCommitIndex() {
 	rf.commitIndex = c[idx]
 	//rf.cond.Broadcast()
 	to := rf.commitIndex
-	go rf.applyLogs(from, to)
+	if to >= from {
+		go rf.applyLogs(from, to)
+	}
 }
 
 func (rf *Raft) applyLogs(from, to int) {
 	DPrintf("%d is applying log from index %d to %d", rf.me, from, to)
+	rf.applyLogMu.Lock()
+	defer rf.applyLogMu.Unlock()
+
+	for rf.appliedUpTo < from - 1 {
+		rf.applyLogCond.Wait()
+	}
+
+	// other thread could have applied logs and modified rf.appliedUpTo
+	if rf.appliedUpTo >= to {
+		return
+	} else if rf.appliedUpTo >= from {
+		from = rf.appliedUpTo + 1
+	}
+
+	// TODO: (see another TODO around line 219: what if an append 2-5 is received, commited and applied, and then an old PRC append 2-4 arrive and delete applied log? need enhancement here.)
+	to = min(to, len(rf.log) - 1)
+
 	for i := from; i <= to; i++ {
 		log := rf.log[i]
 		rf.applyCh <- ApplyMsg{
@@ -586,6 +624,9 @@ func (rf *Raft) applyLogs(from, to int) {
 			CommandIndex: log.Index,
 		}
 	}
+	rf.appliedUpTo = to
+	rf.applyLogCond.Broadcast()
+	DPrintf("%d completed applying log from index %d to %d", rf.me, from, to)
 }
 
 func min(a, b int) int {
