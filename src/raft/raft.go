@@ -60,13 +60,13 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
-	applyCh   chan ApplyMsg
-	cond      *sync.Cond
+	mu           sync.Mutex          // Lock to protect shared access to this peer's state
+	peers        []*labrpc.ClientEnd // RPC end points of all peers
+	persister    *Persister          // Object to hold this peer's persisted state
+	me           int                 // this peer's index into peers[]
+	dead         int32               // set by Kill()
+	applyCh      chan ApplyMsg
+	cond         *sync.Cond
 	appliedUpTo  int
 	applyLogMu   sync.Mutex
 	applyLogCond *sync.Cond
@@ -288,12 +288,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) > 0 {
 			DPrintf("%d before append log, log len: %d, PreLogIndex: %d, entries len: %d", rf.me, len(rf.log), args.PreLogIndex, len(args.Entries))
 			rf.log = append(rf.log[0:args.PreLogIndex+1], args.Entries...)
-			// TODO: what if an append 2-5 is received, commited and applied, and then an old PRC append 2-4 arrive and delete applied log? need enhancement here.
+
+			idx := args.PreLogIndex
+			for i := 0; i < len(args.Entries); i++ {
+				if idx+i+1 >= len(rf.log) {
+					rf.log = append(rf.log, args.Entries[i:]...)
+					break
+				} else if rf.log[idx+i+1].Term != args.Entries[i].Term {
+					rf.log = append(rf.log[0:idx+i+1], args.Entries[i:]...)
+					break
+				}
+			}
 			DPrintf("%d after append log, log len: %d, PreLogIndex: %d, entries len: %d", rf.me, len(rf.log), args.PreLogIndex, len(args.Entries))
 		}
 		if args.LeaderCommit > rf.commitIndex {
 			from := rf.commitIndex + 1
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 			to := rf.commitIndex
 			go rf.applyLogs(from, to)
 		}
@@ -311,7 +321,6 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 	nextIndex := rf.nextIndex[server]
 	preLog := rf.log[nextIndex-1]
-	// TODO: design review, do we send a batch of logs, or only one log entry every time?
 	entries := rf.log[nextIndex:]
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -390,10 +399,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 
-	num := rf.peers
+	num := len(rf.peers)
 	rf.mu.Unlock()
 
-	for i := 0; i < len(num); i++ {
+	for i := 0; i < num; i++ {
 		go func(p int) {
 			if p != rf.me {
 				rf.sendAppendEntries(p)
@@ -589,7 +598,12 @@ func (rf *Raft) advanceCommitIndex() {
 	sort.Sort(sort.Reverse(sort.IntSlice(c)))
 	idx := len(rf.peers) / 2
 	from := rf.commitIndex + 1
-	rf.commitIndex = c[idx]
+	N := c[idx]
+	if rf.log[N].Term != rf.currentTerm {
+		return
+	}
+
+	rf.commitIndex = N
 	//rf.cond.Broadcast()
 	to := rf.commitIndex
 	if to >= from {
@@ -598,13 +612,15 @@ func (rf *Raft) advanceCommitIndex() {
 }
 
 func (rf *Raft) applyLogs(from, to int) {
-	DPrintf("%d is applying log from index %d to %d", rf.me, from, to)
+	DPrintf("%d is applying log from index %d to %d, appliedUpTo: %d", rf.me, from, to, rf.appliedUpTo)
 	rf.applyLogMu.Lock()
 	defer rf.applyLogMu.Unlock()
 
-	for rf.appliedUpTo < from - 1 {
+	for rf.appliedUpTo < from-1 {
+		DPrintf("%d's appliedUpTo %d is less than (from) %d - 1, should wait now", rf.me, rf.appliedUpTo, from)
 		rf.applyLogCond.Wait()
 	}
+	DPrintf("%d's appliedUpTo is %d now", rf.me, rf.appliedUpTo)
 
 	// other thread could have applied logs and modified rf.appliedUpTo
 	if rf.appliedUpTo >= to {
@@ -613,8 +629,8 @@ func (rf *Raft) applyLogs(from, to int) {
 		from = rf.appliedUpTo + 1
 	}
 
-	// TODO: (see another TODO around line 219: what if an append 2-5 is received, commited and applied, and then an old PRC append 2-4 arrive and delete applied log? need enhancement here.)
-	to = min(to, len(rf.log) - 1)
+	// seems sometimes follower's committed logs can be truncated, not figured out why yet
+	to = min(to, len(rf.log)-1)
 
 	for i := from; i <= to; i++ {
 		log := rf.log[i]
@@ -626,7 +642,7 @@ func (rf *Raft) applyLogs(from, to int) {
 	}
 	rf.appliedUpTo = to
 	rf.applyLogCond.Broadcast()
-	DPrintf("%d completed applying log from index %d to %d", rf.me, from, to)
+	DPrintf("%d completed applying log from index %d to %d, appliedUpTo is updated to %d", rf.me, from, to, rf.appliedUpTo)
 }
 
 func min(a, b int) int {
