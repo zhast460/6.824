@@ -18,15 +18,15 @@ package raft
 //
 
 import (
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
 	"time"
 )
 import "../labrpc"
-
-// import "bytes"
-// import "../labgob"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -67,7 +67,6 @@ type Raft struct {
 	dead         int32               // set by Kill()
 	applyCh      chan ApplyMsg
 	cond         *sync.Cond
-	appliedUpTo  int
 	applyLogMu   sync.Mutex
 	applyLogCond *sync.Cond
 
@@ -79,6 +78,7 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+	appliedUpTo int
 
 	// volatile
 	commitIndex int
@@ -117,13 +117,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.appliedUpTo)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -134,18 +135,24 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	var appliedUpTo int
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&appliedUpTo) != nil {
+		fmt.Println("Couldn't decode persisted states.")
+		DPrintf("Couldn't decode persisted states.")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+		rf.appliedUpTo = appliedUpTo
+	}
 }
 
 //
@@ -180,6 +187,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 3rd: grant yes will reset timeout, grant no won't
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	votedFor := rf.votedFor
 
 	if args.Term < rf.currentTerm {
@@ -264,6 +272,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	//DPrintf("%d received term %d append entries from %d", rf.me, args.Term, args.LeaderId)
 	if args.Term < rf.currentTerm {
@@ -332,7 +341,7 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 	reply := AppendEntriesReply{}
 
-	DPrintf("%d sending term %d append entries to %d, whose nextIndex: %d, entry size: %d, commands: %v", rf.me, rf.currentTerm, server, rf.nextIndex[server], len(entries), entries)
+	DPrintf("%d sending term %d append entries to %d, whose nextIndex: %d, entry size: %d", rf.me, rf.currentTerm, server, rf.nextIndex[server], len(entries)) //commands: %v , entries)
 	rf.mu.Unlock()
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
@@ -359,6 +368,7 @@ func (rf *Raft) sendAppendEntries(server int) {
 		}
 		DPrintf("leader %d got NOT success from %d, its nextIndex-1 = %d", rf.me, server, rf.nextIndex[server])
 	}
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -400,6 +410,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 
 	num := len(rf.peers)
+	rf.persist()
 	rf.mu.Unlock()
 
 	for i := 0; i < num; i++ {
@@ -525,6 +536,7 @@ func (rf *Raft) KickoffElection() {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.ConvertToFollower(reply.Term)
+					rf.persist()
 					rf.mu.Unlock()
 					return
 				}
@@ -540,10 +552,12 @@ func (rf *Raft) KickoffElection() {
 						}
 					}
 				}
+				rf.persist()
 				rf.mu.Unlock()
 			}(i)
 		}
 	}
+	rf.persist()
 	rf.mu.Unlock()
 }
 
